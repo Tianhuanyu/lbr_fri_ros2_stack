@@ -77,6 +77,7 @@ class TrackingController:
         
         pi = optas.np.pi  # 3.141...
         T = 1  # no. time steps in trajectory
+        
 
         # Setup robot
         kuka = optas.RobotModel(
@@ -129,7 +130,7 @@ class TrackingController:
         
         diffR = Rg_ee.T @ R
         cvf = Rc.T @ fh[:3]
-        diffFl = nf @ nf.T @ (optas.diag([0.2, 0.2, 0.2]) @ cvf -  Rc.T @dp[:3])
+        diffFl =  optas.diag([0.2, 0.2, 0.2]) @ cvf -  Rc.T @dp[:3]
         
 
         rvf = Rc.T @ fh[3:]
@@ -137,14 +138,14 @@ class TrackingController:
 
         # diffFr = nf @ nf.T @ (fh[3:] - optas.diag([1e-3, 1e-3, 1e-3]) @ Rc.T @dq[3:])
 
-        W_p = optas.diag([1e3, 1e3, 1e3])
-        builder.add_cost_term("match_p", diffp.T @ W_p @ diffp)
+        # W_p = optas.diag([1e3, 1e3, 1e3])
+        # builder.add_cost_term("match_p", diffp.T @ W_p @ diffp)
 
         W_f = optas.diag([1e4, 1e4, 1e4])
         builder.add_cost_term("match_f", diffFl.T @ W_f @ diffFl)
 
-        W_fr = optas.diag([1e4, 1e4, 1e4])
-        builder.add_cost_term("match_fr", diffFR.T @ W_fr @ diffFR)
+        # W_fr = optas.diag([1e4, 1e4, 1e4])
+        # builder.add_cost_term("match_fr", diffFR.T @ W_fr @ diffFR)
         
         w_dq = 0.01
         builder.add_cost_term("min_dq", w_dq * optas.sumsqr(dq))

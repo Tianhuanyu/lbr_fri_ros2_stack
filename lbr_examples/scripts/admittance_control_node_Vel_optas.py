@@ -73,13 +73,15 @@ class TrackingController:
         end_link_name: str = "lbr_link_ee",
         root_link_name: str = "lbr_link_0",
         f_threshold: np.ndarray = np.array([6.0, 6.0, 6.0, 1.0, 1.0, 1.0]),
-        dx_gain: np.ndarray = np.array([0.1, 0.1, 0.1, 20.0, 40.0, 60.0]),
-        smooth: float = 0.02,):
+        dx_gain: np.ndarray = np.array([1.0, 1.0, 1.0, 20.0, 40.0, 60.0]),
+        smooth: float = 0.1,)->None:
         dt = 0.01
         
         pi = optas.np.pi  # 3.141...
         T = 1  # no. time steps in trajectory
-
+        self.f_threshold_ = f_threshold
+        self.dx_gain_ = np.diag(dx_gain)
+        self.smooth_ = smooth
         # Setup robot
         kuka = optas.RobotModel(
             xacro_filename=urdf_string,
@@ -94,9 +96,7 @@ class TrackingController:
 
         self.dof_ = len(self.chain_.get_joint_parameter_names())
         self.dq_ = np.zeros(self.dof_)
-        self.f_threshold_ = f_threshold
-        self.dx_gain_ = dx_gain
-        self.smooth_ = smooth
+        
 
         # setup model
         T = 1
@@ -142,22 +142,22 @@ class TrackingController:
         
         diffR = Rg_ee.T @ R
         cvf = Rc.T @ fh[:3]
-        diffFl = nf @ nf.T @ (cvf-  Rc.T @dp[:3])
+        diffFl =optas.diag([0.2, 0.2, 0.2]) @ Rc.T @ fh[:3]-  Rc.T @ dp[:3]
         
 
         rvf = Rc.T @ fh[3:]
-        diffFR =  rvf - Rc.T @dp[3:]
+        diffFR =  optas.diag([0.2, 0.2, 0.2])@ rvf - Rc.T @dp[3:]
 
         # diffFr = nf @ nf.T @ (fh[3:] - optas.diag([1e-3, 1e-3, 1e-3]) @ Rc.T @dq[3:])
 
         # W_p = optas.diag([1e3, 1e3, 1e3])
         # builder.add_cost_term("match_p", diffp.T @ W_p @ diffp)
 
-        W_f = optas.diag([1e8, 1e8, 1e8])
+        W_f = optas.diag([1e2, 1e2, 1e2])
         builder.add_cost_term("match_f", diffFl.T @ W_f @ diffFl)
 
-        # W_fr = optas.diag([1e4, 1e4, 1e4])
-        # builder.add_cost_term("match_fr", diffFR.T @ W_fr @ diffFR)
+        W_fr = optas.diag([1e2, 1e2, 1e2])
+        builder.add_cost_term("match_fr", diffFR.T @ W_fr @ diffFR)
         
         w_dq = 0.01
         builder.add_cost_term("min_dq", w_dq * optas.sumsqr(dq))
@@ -167,25 +167,25 @@ class TrackingController:
 
  
         builder.add_leq_inequality_constraint(
-            "dq1", dq[0] * dq[0], 1e0
+            "dq1", dq[0] * dq[0], 1e1
         )
         builder.add_leq_inequality_constraint(
-            "dq2", dq[1] * dq[1], 1e0
+            "dq2", dq[1] * dq[1], 1e1
         )
         builder.add_leq_inequality_constraint(
-            "dq3", dq[2] * dq[2], 1e0
+            "dq3", dq[2] * dq[2], 1e1
         )
         builder.add_leq_inequality_constraint(
-            "dq4", dq[3] * dq[3], 1e0
+            "dq4", dq[3] * dq[3], 1e1
         )
         builder.add_leq_inequality_constraint(
-            "dq5", dq[4] * dq[4], 1e0
+            "dq5", dq[4] * dq[4], 1e1
         )
         builder.add_leq_inequality_constraint(
-            "dq6", dq[5] * dq[5], 1e0
+            "dq6", dq[5] * dq[5], 1e1
         )
         builder.add_leq_inequality_constraint(
-            "dq7", dq[6] * dq[6], 1e0
+            "dq7", dq[6] * dq[6], 1e1
         )
         # builder.add_leq_inequality_constraint(
         #     "eff_z", diffp[2] * diffp[2], 1e-8
@@ -213,14 +213,20 @@ class TrackingController:
         jacobian_inv = np.linalg.pinv(jacobian, rcond=0.05)
 
         f_ext = jacobian_inv.T @ tau_ext
+        # print("f_ext1 = {0}".format(f_ext))
         f_ext = np.where(
             abs(f_ext) > self.f_threshold_,
             self.dx_gain_ @ np.sign(f_ext) * (abs(f_ext) - self.f_threshold_),
-            0.0,
+            0.0
         )
+        
+
+
+        # print("self.dx_gain_ = {0}".format(self.dx_gain_))
+        # print("f_ext2 = {0}".format(f_ext))
 
         dq = self.compute_target_velocity(q, pg, f_ext)
-        print("f_ext = {0}".format(f_ext))
+        # print("v = {0}".format(jacobian @ dq))
         # dq = self.dq_gain_ @ jacobian_inv @ f_ext
         self.dq_ = (1.0 - self.smooth_) * self.dq_ + self.smooth_ * dq
         return self.dq_, f_ext
