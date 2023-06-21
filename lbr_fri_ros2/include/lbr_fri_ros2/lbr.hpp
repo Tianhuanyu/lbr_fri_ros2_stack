@@ -13,7 +13,7 @@
 
 namespace lbr_fri_ros2 {
 struct LBR {
-  static constexpr uint8_t JOINT_DOF = KUKA::FRI::LBRState::NUMBER_OF_JOINTS;
+  static constexpr uint8_t JOINT_DOF = 7;//KUKA::FRI::LBRState::NUMBER_OF_JOINTS;
   static constexpr uint8_t CARTESIAN_DOF = 6;
 
   LBR();

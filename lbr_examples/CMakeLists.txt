@@ -19,6 +19,9 @@ ament_target_dependencies(
 install(
     PROGRAMS
         scripts/admittance_control_node.py
+        scripts/admittance_control_node_Vel.py
+        scripts/admittance_control_node_Vel_optas.py
+        scripts/admittance_control_Hybrid.py
         scripts/lbr_command_node.py
     DESTINATION lib/${PROJECT_NAME}
 )
