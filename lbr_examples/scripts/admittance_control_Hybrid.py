@@ -234,7 +234,7 @@ class AdmittanceControlNode(Node):
             get_package_share_directory("lbr_description"),
             "urdf",
             self.model_,
-            f"{self.model_}.urdf.xacro",
+            f"{self.model_}_dock.urdf.xacro",
         )
         self.urdf_string_ = xacro.process(path)
 
