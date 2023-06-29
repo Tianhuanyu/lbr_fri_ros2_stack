@@ -23,6 +23,8 @@ setup(
     entry_points={
         "console_scripts": [
             "admittance_control_node = lbr_fri_ros2_advanced_python_demos.admittance_control_node:main",
+            "admittance_control_Hybrid = lbr_fri_ros2_advanced_python_demos.admittance_control_Hybrid:main",
+            "admittance_control_node_Vel = lbr_fri_ros2_advanced_python_demos.admittance_control_Vel:main",
         ],
     },
 )

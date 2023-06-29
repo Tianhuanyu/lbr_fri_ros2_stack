@@ -1,3 +1,5 @@
+
+import time
 import numpy as np
 import rclpy
 from rclpy.duration import Duration
@@ -48,10 +50,19 @@ class AdmittanceControlNode(Node):
             ),
         )
 
-    def on_lbr_state_(self, lbr_state: LBRState) -> None:
-        self.smooth_lbr_state_(lbr_state, 0.95)
+        self.count = 0
+        self.time = 0
 
+    def on_lbr_state_(self, lbr_state: LBRState) -> None:
+        self.smooth_lbr_state_(lbr_state, 1.0)
+
+        start = time.time()
         lbr_command = self.controller_(self.lbr_state_)
+        # time.sleep(np.random.randint(0, 10)/1.e3)
+        end = time.time()
+        self.time += end - start
+        self.count += 1
+        self.get_logger().info(f"{self.time / self.count * 1.e3}")
         self.lbr_command_pub_.publish(lbr_command)
 
     def smooth_lbr_state_(self, lbr_state: LBRState, alpha: float):
