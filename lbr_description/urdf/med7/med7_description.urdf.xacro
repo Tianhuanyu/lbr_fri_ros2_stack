@@ -304,6 +304,13 @@
         </joint>
 
         <link name="${robot_name}_link_ee">
+            <inertial>
+                <origin rpy="0 0 0"
+                    xyz="-7.073221144775636e-07 0.07101990943401648 0.004952526180360017" />
+                <mass value="2.316917" />
+                <inertia ixx="0.006813" ixy="-0.000000" ixz="0.000000" iyy="0.006559" iyz="0.000300"
+                    izz="0.004462" />
+            </inertial>
         </link>
 
         <xacro:med_gazebo robot_name="${robot_name}" />
