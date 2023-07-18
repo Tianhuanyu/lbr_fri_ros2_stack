@@ -56,8 +56,8 @@ def RNEA_function(Nb,Nk,rpys,xyzs,axes):
     
     om0 = cs.DM([0.0,0.0,0.0])
     om0D = cs.DM([0.0,0.0,0.0])
-    # gravity_para = cs.DM([0.0, 0.0, -9.81])
-    gravity_para = cs.DM([4.905, 0.0, -8.496])
+    gravity_para = cs.DM([0.0, 0.0, -9.81])
+    # gravity_para = cs.DM([4.905, 0.0, -8.496])
 
     """
     The definination of joint position from joint0 to joint(Nb-1)
@@ -449,7 +449,7 @@ def from_T442pose(T44):
     p,q = from_T442pq(T44)
     pose = np.array([0.0]*7)
     pose[:3] = p
-    pose[3:] = q
+    pose[3:] = q/np.linalg.norm(q)
     return pose
 
 class TrackingController:
@@ -457,9 +457,9 @@ class TrackingController:
         urdf_string: str,
         end_link_name: str = "lbr_link_ee",
         root_link_name: str = "lbr_link_0",
-        f_threshold: np.ndarray = np.array([2.0, 2.0, 2.0, 0.5, 0.5, 0.5]),
-        dx_gain: np.ndarray = np.array([1.0, 1.0, 1.0, 20.0, 40.0, 60.0]),
-        smooth: float = 0.01,)->None:
+        f_threshold: np.ndarray = np.array([2.0 , 2.0, 5.0, 0.5, 0.5, 0.5]),
+        dx_gain: np.ndarray = np.array([0.5, 0.5, 0.2, 1.0, 1.0, 1.0]),
+        smooth: float = 0.1,)->None:
         dt = 0.01
         
         pi = optas.np.pi  # 3.141...
@@ -481,11 +481,12 @@ class TrackingController:
 
         self.dof_ = len(self.chain_.get_joint_parameter_names())
         self.dq_ = np.zeros(self.dof_)
-        
 
         # setup model
         T = 1
         builder = optas.OptimizationBuilder(T, robots=[kuka], derivs_align=True)
+        
+
         # Setup parameters
         qc = builder.add_parameter("qc", kuka.ndof)  # current robot joint configuration
         pg = builder.add_parameter("pg", 7) # current robot joint configuration
@@ -511,25 +512,31 @@ class TrackingController:
         Om = skew(dp[3:]) 
 
         #TODO
-        p = Rc.T @ dt @ dp[:3]
-        R = Rc.T @ (Om * dt + I3())
+        p = dt @ dp[:3]  #p = Rc.T @ dt @ dp[:3]?
+        R = Rc.T @ (Om * dt + I3()) @ Rc
         
         # Cost: match end-effector position
-        Rotq = Quaternion(pg[3],pg[4],pg[5],pg[6])
+        Rotq = Quaternion(pg[4],pg[5],pg[6],pg[3])
         Rg = Rotq.getrotm()
         
-        pg_ee = -Rc.T @ pc + Rc.T @ pg[:3]
+        pg_ee = -Rc.T @ pc + Rc.T @ (pg[:3]- optas.DM([0.0,0.0,0.2]))
         # pg_ee = optas.DM([0.0,0.0,0.0]).T
         # pg_ee = -Rc.T @ pc
         Rg_ee = Rc.T @ Rg
 
-   
-        diffp = optas.diag([0.2, 0.2, 0.0]) @ (p - pg_ee[:3])
+        Bx = 0.05
+        By = 0.05
+
+        # diffp = optas.diag([2.0, 2.0, 0.0]) @ (p - 0.1*pg_ee[:3])
         # diffp = optas.diag([0.2, 0.2, 0.2]) @ p
         
         diffR = Rg_ee.T @ R
         cvf = Rc.T @ fh[:3]
-        diffFl =optas.diag([0.25, 0.25, 0.25]) @ Rc.T @ fh[:3] -  Rc.T @ dp[:3]
+        # diffFl =optas.diag([0.25, 0.25, 0.25]) @ Rc.T @ fh[:3] -  Rc.T @ dp[:3]
+        # diffFl =optas.diag([0.00, 0.00, 0.25]) @ Rc.T @ fh[:3] -  Rc.T @ dp[:3]
+        # diffFl = optas.diag([1.0, 1.0, 0.0]) @ (p- pg_ee- optas.diag([Bx, By, 0.0]) @ cvf ) +diffFl
+        diffp = optas.diag([1.0, 1.0, 0.0]) @ (pg_ee[:3]-p) 
+        diffFl = optas.diag([0.00, 0.00, 0.1]) @ (-Rc.T @ fh[:3] +  Rc.T @ dp[:3])
         
 
 
@@ -537,8 +544,8 @@ class TrackingController:
         diffFR =  optas.diag([0.1, 0.1, 0.1])@ rvf - Rc.T @dp[3:]
         # diffFr = nf @ nf.T @ (fh[3:] - optas.diag([1e-3, 1e-3, 1e-3]) @ Rc.T @dq[3:])
 
-        # W_p = optas.diag([1e4, 1e4, 1e4])
-        # builder.add_cost_term("match_p", diffp.T @ W_p @ diffp)
+        W_p = optas.diag([1e3, 1e3, 1e3])
+        builder.add_cost_term("match_p", diffp.T @ W_p @ diffp)
 
         # builder.add_leq_inequality_constraint(
         #     "p_con", diffp.T @ diffp, 0.0000001
@@ -547,10 +554,10 @@ class TrackingController:
         W_f = optas.diag([1e3, 1e3, 1e3])
         builder.add_cost_term("match_f", diffFl.T @ W_f @ diffFl)
 
-        W_fr = optas.diag([1e1, 1e1, 1e1])
-        builder.add_cost_term("match_fr", diffFR.T @ W_fr @ diffFR)
+        # W_fr = optas.diag([1e1, 1e1, 1e1])
+        # builder.add_cost_term("match_fr", diffFR.T @ W_fr @ diffFR)
         
-        w_dq = 0.01
+        w_dq = 0.1
         builder.add_cost_term("min_dq", w_dq * optas.sumsqr(dq))
 
         # w_ori = 1e1
@@ -558,34 +565,52 @@ class TrackingController:
 
  
         builder.add_leq_inequality_constraint(
-            "dq1", dq[0] * dq[0], 4e2
+            "dq1", dq[0] * dq[0], 1e2
         )
         builder.add_leq_inequality_constraint(
-            "dq2", dq[1] * dq[1], 4e2
+            "dq2", dq[1] * dq[1], 1e2
         )
         builder.add_leq_inequality_constraint(
-            "dq3", dq[2] * dq[2], 4e2
+            "dq3", dq[2] * dq[2], 1e2
         )
         builder.add_leq_inequality_constraint(
-            "dq4", dq[3] * dq[3], 4e2
+            "dq4", dq[3] * dq[3], 1e2
         )
         builder.add_leq_inequality_constraint(
-            "dq5", dq[4] * dq[4], 4e2
+            "dq5", dq[4] * dq[4], 1e2
         )
         builder.add_leq_inequality_constraint(
-            "dq6", dq[5] * dq[5], 4e2
+            "dq6", dq[5] * dq[5], 1e2
         )
         builder.add_leq_inequality_constraint(
-            "dq7", dq[6] * dq[6], 4e2
+            "dq7", dq[6] * dq[6], 1e2
         )
         # builder.add_leq_inequality_constraint(
         #     "eff_z", diffp[2] * diffp[2], 1e-8
+
+        
         # )
+
+        Om = skew(dp[3:]) 
+        
+        # print("eff_goal size = {0}".format(eff_goal.size()))
+        # RF = (Om * dt + I3()) @ Rc  
+        RF = (Om * dt + I3()) @ Rc
+        zF = RF[:3,2]
+        #TODO
+        axis_align_update = Rg[:,2]
+        builder.add_cost_term("eff_axis_align", 1e2 * optas.sumsqr(zF - axis_align_update))
+
+        self.distance = optas.Function('distance', [qc, pg], [pg_ee])
+        self.rg = optas.Function('rg', [qc, pg], [axis_align_update])
+        # self.zf = optas.Function('zf', [qc, pg], [zF])
 
         optimization = builder.build()
         self.solver = optas.CasADiSolver(optimization).setup("sqpmethod")
         # self.solver = optas.ScipyMinimizeSolver(optimization).setup('SLSQP')
         # Setup variables required later
+
+        
         
 
         self.solution = None
@@ -621,12 +646,18 @@ class TrackingController:
         jacobian_inv = np.linalg.pinv(jacobian, rcond=0.05)
 
         f_ext = jacobian_inv.T @ tau_ext
+        f_ext_raw = copy.deepcopy(f_ext)
         # print("f_ext1 = {0}".format(f_ext))
+        # TODO 是否可以考虑在这里增加一个静态偏执。 用于数据分析。
         f_ext = np.where(
             abs(f_ext) > self.f_threshold_,
             self.dx_gain_ @ np.sign(f_ext) * (abs(f_ext) - self.f_threshold_),
             0.0
         )
+
+        # print("self.distance = {0}".format(self.distance(q,pg)))
+        print("self.rg = {0}".format(self.rg(q,pg)))
+        # print("self.zf = {0}".format(self.zf(q,pg)))
         
 
 
@@ -637,7 +668,8 @@ class TrackingController:
         # print("v = {0}".format(jacobian @ dq))
         # dq = self.dq_gain_ @ jacobian_inv @ f_ext
         self.dq_ = (1.0 - self.smooth_) * self.dq_ + self.smooth_ * dq
-        return self.dq_, f_ext
+        # self.dq_ = dq
+        return self.dq_, f_ext_raw
 
 # class DockingController(TrackingController):
 #     def __init__(self,
@@ -742,6 +774,10 @@ class AdmittanceControlNode(Node):
         self.qd_last = np.array([0.0]*7)
         self.pa_size = Pb.shape[1]
 
+        self.T_bt = np.zeros([4,4])
+        self.T_bt[3,3] = 1.0
+        self.tau_ext_ground = None
+
         # pg = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     def on_timer_(self):
@@ -750,11 +786,25 @@ class AdmittanceControlNode(Node):
         q = np.array(self.lbr_state_.measured_joint_position.tolist())
         tau = np.array(self.lbr_state_.measured_torque.tolist())
 
+        qdd = (self.qd-self.qd_last)/0.01
+        current_pose = self.chain_.forward_kinematics(q)
+        T_be = from_pq2T44(current_pose.pos,current_pose.rot)
+
         if(self.init_):
             self.pg = self.chain_.forward_kinematics(q)
             print(self.pg)
             self.init_ = False
             self.q_last = copy.deepcopy(q)
+
+            # jacobian = self.chain_.jacobian(q)
+            # jacobian_inv = np.linalg.pinv(jacobian, rcond=0.05)
+            # f_ext_base = jacobian_inv.T @ tau_ext
+            self.tau_ext_ground = tau - (self.Ymat(q.tolist(),
+                                   self.qd.tolist(),
+                                   qdd.tolist())@self.Pb @  self.params[:self.pa_size] + 
+                np.diag(np.sign(self.qd)) @ self.params[self.pa_size:self.pa_size+7]+ 
+                np.diag(qdd) @ self.params[self.pa_size+7:])
+
             return
         else:
             pass
@@ -762,30 +812,64 @@ class AdmittanceControlNode(Node):
         pg[:3] = self.pg.pos
         pg[3:] = self.pg.rot
 
+        # pose_bt = pg
+
         # print("self.goal_pose_ = {0}".format(self.goal_pose_))
 
-        current_pose = self.chain_.forward_kinematics(q)
+        
         # print("The error = {0}".format(pg[:3]-current_pose.pos))
 
+        # ee 贴反了
+        if(self.goal_pose_ is not None):
+            T_et = from_msg2T44(self.goal_pose_)
+            self.T_bt = T_be @ T_et
+        
+            print("self.T_be z = {0}".format(T_be[:,2]))
+            print("self.T_et z = {0}".format(T_et[:,2]))
+        
+        print("self.T_bt z = {0}".format(self.T_bt[:,2]))
 
+        pose_bt = from_T442pose(self.T_bt)
+        csv_save("/home/thy/ros2_ws/pose_bt.csv", pose_bt)
+        csv_save("/home/thy/ros2_ws/pose_br.csv", current_pose.pos)
+        
         # dq, f_ext = self.controller_(q, tau_ext)
-        qdd = (self.qd-self.qd_last)/0.01
-
+        
+        # print("pose_bt",pose_bt)
+        R_be = T_be[:3,:3]
         tau_ext = tau - (self.Ymat(q.tolist(),
                                    self.qd.tolist(),
                                    qdd.tolist())@self.Pb @  self.params[:self.pa_size] + 
                 np.diag(np.sign(self.qd)) @ self.params[self.pa_size:self.pa_size+7]+ 
-                np.diag(qdd) @ self.params[self.pa_size+7:])
+                np.diag(qdd) @ self.params[self.pa_size+7:]) - self.tau_ext_ground
 
         # TODO
         # Target position should be given according to vision. A static one can be given firstly
         # Param: pg ->
-        print("tau_ext = {0}".format(tau_ext))
+        # pose_bt[:3] = 0.05*pose_bt[:3] + 0.95 *current_pose.pos
         # print("tau = {0}".format(tau))
         # print("self.qd = {0}".format(self.qd))
         # print("tau_ext = {0}".format(tau_ext.toarray().flatten().shape))
         # print("tau = {0}".format(tau.shape))
-        dq, f_ext = self.controller_optas(q, pg ,tau_ext.toarray().flatten())
+        dq, f_ext = self.controller_optas(q, pose_bt ,tau_ext.toarray().flatten())
+
+        self.jacobian_ = np.array(self.chain_.jacobian(q))
+
+        self.jacobian_inv_ = np.linalg.pinv(self.jacobian_, rcond=0.05)
+
+        # print(self.jacobian_)
+        temp_r = np.array([0.0]*6)
+        temp_r[:3] = R_be.T @ (pose_bt[:3]- current_pose.pos - np.array([0.0, 0.0, 0.2]))
+        print("f_ext = {0}".format(f_ext))
+        print("pose_bt = {0}".format(pose_bt))
+        print("current_pose.pos = {0}".format(current_pose.pos))
+
+        # temp_r[:3] = np.array([0.0, 0.1, 0.0])
+
+        ## clasic controller 
+        # dq = 10.03 * self.jacobian_inv_@ (temp_r)
+
+        
         # TrackingController()
         self.qd_last = copy.deepcopy(self.qd)
         self.qd = q-self.q_last
@@ -797,14 +881,6 @@ class AdmittanceControlNode(Node):
         ).data
         # print("self.lbr_state_.sample_time * dq * 1.0 = {0}",format(self.lbr_state_.sample_time * dq * 1.0))
         # print("goal = {0}",format(self.goal_pose_))
-        if(self.goal_pose_ is not None):
-            T_et = from_msg2T44(self.goal_pose_)
-            T_be = from_pq2T44(current_pose.pos,current_pose.rot)
-            T_bt = T_be @ T_et
-
-            pose_bt = from_T442pose(T_bt)
-            print("pose_bt",pose_bt)
-            csv_save("/home/thy/ros2_ws/pose_bt", pose_bt)
 
         self.command_init_ = True
 
