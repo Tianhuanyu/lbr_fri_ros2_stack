@@ -27,6 +27,75 @@ from optas.spatialmath import *
 
 from scipy.spatial.transform import Rotation as Rot
 from geometry_msgs.msg import Pose
+import math
+
+def sign(x):
+    if x > 0:
+        return 1
+    elif x < 0:
+        return -1
+    else:
+        return 0
+
+def fhan(x1, x2, u, r, h):
+    d = r * h
+    d0 = d* h
+    y = x1 - u+h*x2
+    a0 = math.sqrt(d*d + 8*r*abs(y))
+
+    if abs(y) <= d0:
+        a = x2 + y/h
+    else:
+        a = x2+0.5*(a0-d)*sign(y)
+
+    if abs(a)<=d:
+        return -r*a/d
+    else:
+        return -r*sign(a)
+    
+class TD_2order:
+    def __init__(self, T=0.01, r=10.0, h=0.1):
+        self.x1 = None
+        self.x2 = None
+        self.T = T
+        self.r = r
+        self.h = h
+
+    def __call__(self, u):
+        if self.x1 is None or self.x2 is None:
+            self.x1 = 0
+            self.x2 = 0
+
+        x1k = self.x1
+        x2k = self.x2
+        self.x1 = x1k + self.T* x2k
+        self.x2 = x2k + self.T* fhan(x1k, x2k, u, self.r, self.h)
+
+        return self.x1, self.x2
+    
+class TD_list_filter:
+    def __init__(self, T=0.01, r=10.0, h=0.1, len = 7) -> None:
+        self.x1_list = None
+        self.x2_list = None
+
+        self.T = T
+        self.r = r
+        self.h = h
+        self.len = len
+
+    def __call__(self, us):
+        if self.x1_list is None or self.x2_list is None:
+            self.x1_list = [0.0] * self.len
+            self.x2_list = [0.0] * self.len
+
+        x1k = np.array(self.x1_list)
+        x2k = np.array(self.x2_list)
+
+        self.x1_list = x1k + self.T *x2k
+        f = np.array([fhan(x1, x2, u, self.r, self.h) for (x1, x2, u) in zip(x1k, x2k, us)])
+        self.x2_list = x2k + self.T *f
+
+        return self.x1_list, self.x2_list
 
 
 # tau = {0} [-1.1552312   3.70274581 -1.09817682 -3.02117871  0.23070508  0.51952975
@@ -457,9 +526,9 @@ class TrackingController:
         urdf_string: str,
         end_link_name: str = "lbr_link_ee",
         root_link_name: str = "lbr_link_0",
-        f_threshold: np.ndarray = np.array([2.0 , 2.0, 5.0, 0.5, 0.5, 0.5]),
-        dx_gain: np.ndarray = np.array([0.5, 0.5, 0.2, 1.0, 1.0, 1.0]),
-        smooth: float = 0.1,)->None:
+        f_threshold: np.ndarray = np.array([2.0 , 2.0, 2.0, 0.5, 0.5, 0.5]),
+        dx_gain: np.ndarray = np.array([2.0, 2.0, 2.0, 1.0, 1.0, 1.0]),
+        smooth: float = 0.2,)->None:
         dt = 0.01
         
         pi = optas.np.pi  # 3.141...
@@ -472,7 +541,15 @@ class TrackingController:
             xacro_filename=urdf_string,
             time_derivs=[1],  # i.e. joint velocity
         )
+
+        align = optas.TaskModel(
+            name="appro",
+            dim = 2,
+            #time_derivs=[0],  # i.e. joint velocity
+        )
         self.name = kuka.get_name()
+
+        self.taskname = align.get_name()
 
         urdf_string_ = xacro.process(urdf_string)
         self.chain_ = kinpy.build_serial_chain_from_urdf(
@@ -485,6 +562,7 @@ class TrackingController:
         # setup model
         T = 1
         builder = optas.OptimizationBuilder(T, robots=[kuka], derivs_align=True)
+
         
 
         # Setup parameters
@@ -495,8 +573,14 @@ class TrackingController:
         # Get joint velocity
         dq = builder.get_model_state(self.name, t=0, time_deriv=1)
 
+        # dq5 = builder.get_model_state(self.name, t=-1, time_deriv=1)
+        # X = builder.get_model_states(self.name)
+
+        # alpha = builder.get_model_states("appro")
+
         # Get next joint state
         q = qc + dt * dq
+        
 
         # Get jacobian
         J = kuka.get_global_link_geometric_jacobian(end_link_name, qc)
@@ -512,14 +596,15 @@ class TrackingController:
         Om = skew(dp[3:]) 
 
         #TODO
-        p = dt @ dp[:3]  #p = Rc.T @ dt @ dp[:3]?
+        # p = dt @ dp[:3]  #p = Rc.T @ dt @ dp[:3]?
+        p = Rc.T @ dt @ dp[:3]
         R = Rc.T @ (Om * dt + I3()) @ Rc
         
         # Cost: match end-effector position
-        Rotq = Quaternion(pg[4],pg[5],pg[6],pg[3])
+        Rotq = Quaternion(x = pg[4],y = pg[5],z = pg[6],w =pg[3])
         Rg = Rotq.getrotm()
         
-        pg_ee = -Rc.T @ pc + Rc.T @ (pg[:3]- optas.DM([0.0,0.0,0.2]))
+        pg_ee = -Rc.T @ pc + Rc.T @ pg[:3]
         # pg_ee = optas.DM([0.0,0.0,0.0]).T
         # pg_ee = -Rc.T @ pc
         Rg_ee = Rc.T @ Rg
@@ -535,7 +620,8 @@ class TrackingController:
         # diffFl =optas.diag([0.25, 0.25, 0.25]) @ Rc.T @ fh[:3] -  Rc.T @ dp[:3]
         # diffFl =optas.diag([0.00, 0.00, 0.25]) @ Rc.T @ fh[:3] -  Rc.T @ dp[:3]
         # diffFl = optas.diag([1.0, 1.0, 0.0]) @ (p- pg_ee- optas.diag([Bx, By, 0.0]) @ cvf ) +diffFl
-        diffp = optas.diag([1.0, 1.0, 0.0]) @ (pg_ee[:3]-p) 
+        diffp = optas.diag([1.0, 1.0, 0.0]) @ ( pg_ee[:3] - p) 
+        # diffFl = optas.diag([0.10, 0.10, 0.1]) @ (-Rc.T @ fh[:3] +  Rc.T @ dp[:3])
         diffFl = optas.diag([0.00, 0.00, 0.1]) @ (-Rc.T @ fh[:3] +  Rc.T @ dp[:3])
         
 
@@ -544,7 +630,7 @@ class TrackingController:
         diffFR =  optas.diag([0.1, 0.1, 0.1])@ rvf - Rc.T @dp[3:]
         # diffFr = nf @ nf.T @ (fh[3:] - optas.diag([1e-3, 1e-3, 1e-3]) @ Rc.T @dq[3:])
 
-        W_p = optas.diag([1e3, 1e3, 1e3])
+        W_p = optas.diag([1e10, 1e10, 1e8])
         builder.add_cost_term("match_p", diffp.T @ W_p @ diffp)
 
         # builder.add_leq_inequality_constraint(
@@ -557,8 +643,34 @@ class TrackingController:
         # W_fr = optas.diag([1e1, 1e1, 1e1])
         # builder.add_cost_term("match_fr", diffFR.T @ W_fr @ diffFR)
         
-        w_dq = 0.1
+        w_dq = 0.05
         builder.add_cost_term("min_dq", w_dq * optas.sumsqr(dq))
+
+        Kp = optas.diag([10.0, 10.0])
+        u = Kp @ pg_ee[:2]
+
+
+        # builder.add_leq_inequality_constraint(
+        #     "dp1", p[0] * p[0], u[0]*u[0]
+        # )
+        # builder.add_leq_inequality_constraint(
+        #     "dp2", p[1] * p[1], u[1]*u[1]
+        # )
+
+        builder.add_leq_inequality_constraint(
+            "dp_1", p[0] * p[0], 1e-3
+        )
+        builder.add_leq_inequality_constraint(
+            "dp_2", p[1] * p[1], 1e-3
+        )
+
+
+
+        # w_dp = 0.1
+        # builder.add_cost_term("min_dpw", w_dp * optas.sumsqr(dp[3:]))
+
+        # w_alpha = 0.1
+        # builder.add_cost_term("max_alpha", -w_dq * optas.sumsqr(alpha))
 
         # w_ori = 1e1
         # builder.add_cost_term("match_r", w_ori * optas.sumsqr(diffR - I3()))
@@ -585,24 +697,46 @@ class TrackingController:
         builder.add_leq_inequality_constraint(
             "dq7", dq[6] * dq[6], 1e2
         )
+
+
+        # builder.add_leq_inequality_constraint(
+        #     "dp", dp[0] * dp[0], 1e2
+        # )
+
+        # builder.add_leq_inequality_constraint(
+        #     "alpha_1", alpha[0] , 1.0
+        # )
+        # builder.add_leq_inequality_constraint(
+        #     "alpha_1m", -alpha[0] , 0.0
+        # )
+
+        # builder.add_leq_inequality_constraint(
+        #     "alpha_2", alpha[1] , 1.0
+        # )
+        # builder.add_leq_inequality_constraint(
+        #     "alpha_2m", -alpha[1] , 0.0
+        # )
         # builder.add_leq_inequality_constraint(
         #     "eff_z", diffp[2] * diffp[2], 1e-8
 
         
         # )
 
-        Om = skew(dp[3:]) 
+        # Omtau = skew(dp[3:]) 
         
         # print("eff_goal size = {0}".format(eff_goal.size()))
         # RF = (Om * dt + I3()) @ Rc  
         RF = (Om * dt + I3()) @ Rc
-        zF = RF[:3,2]
-        #TODO
-        axis_align_update = Rg[:,2]
-        builder.add_cost_term("eff_axis_align", 1e2 * optas.sumsqr(zF - axis_align_update))
 
-        self.distance = optas.Function('distance', [qc, pg], [pg_ee])
-        self.rg = optas.Function('rg', [qc, pg], [axis_align_update])
+        # RF = kuka.get_global_link_rotation(end_link_name, qc+dq)
+        zF = RF[:,2]
+        #TODO
+        # Rcomp = ()
+        axis_align_update = Rg[:,2]
+        builder.add_cost_term("eff_axis_align", 1e4 * (optas.sumsqr(zF.T @ axis_align_update - 1.0)))
+
+        self.distance = optas.Function('distance', [qc, pg], [Rc])
+        self.rp = optas.Function('rp', [qc, pg], [Rg])
         # self.zf = optas.Function('zf', [qc, pg], [zF])
 
         optimization = builder.build()
@@ -655,9 +789,14 @@ class TrackingController:
             0.0
         )
 
-        # print("self.distance = {0}".format(self.distance(q,pg)))
-        print("self.rg = {0}".format(self.rg(q,pg)))
+        print("self.distance = {0}".format(self.distance(q,pg)))
+        print("self.rp = {0}".format(self.rp(q,pg)))
         # print("self.zf = {0}".format(self.zf(q,pg)))
+
+        # solution: 3
+        # 1. limit target position, make the target small but efficient
+        # 2. adaptive weighting function
+        # 3. plan the target at the same time
         
 
 
@@ -670,15 +809,772 @@ class TrackingController:
         self.dq_ = (1.0 - self.smooth_) * self.dq_ + self.smooth_ * dq
         # self.dq_ = dq
         return self.dq_, f_ext_raw
+    
 
-# class DockingController(TrackingController):
-#     def __init__(self,
-#     urdf_string: str,
-#     end_link_name: str = "lbr_link_ee",
-#     root_link_name: str = "lbr_link_0",
-#     f_threshold: np.ndarray = np.array([2.0, 2.0, 2.0, 0.5, 0.5, 0.5]),
-#     dx_gain: np.ndarray = np.array([1.0, 1.0, 1.0, 20.0, 40.0, 60.0]),
-#     smooth: float = 0.01,)->None:
+
+
+
+class TrackingControllerVIC:
+    def __init__(self,
+        urdf_string: str,
+        end_link_name: str = "lbr_link_ee",
+        root_link_name: str = "lbr_link_0",
+        f_threshold: np.ndarray = np.array([2.0 , 2.0, 2.0, 0.5, 0.5, 0.5]),
+        dx_gain: np.ndarray = np.array([2.0, 2.0, 2.0, 1.0, 1.0, 1.0]),
+        smooth: float = 0.1,)->None:
+        dt = 0.01
+        
+        pi = optas.np.pi  # 3.141...
+        T = 1  # no. time steps in trajectory
+        self.f_threshold_ = f_threshold
+        self.dx_gain_ = np.diag(dx_gain)
+        self.smooth_ = smooth
+        # Setup robot
+        kuka = optas.RobotModel(
+            xacro_filename=urdf_string,
+            time_derivs=[1],  # i.e. joint velocity
+        )
+
+        align = optas.TaskModel(
+            name="appro",
+            dim = 2,
+            #time_derivs=[0],  # i.e. joint velocity
+        )
+        self.name = kuka.get_name()
+
+        self.taskname = align.get_name()
+
+        urdf_string_ = xacro.process(urdf_string)
+        self.chain_ = kinpy.build_serial_chain_from_urdf(
+            data=urdf_string_, end_link_name=end_link_name, root_link_name=root_link_name
+        )
+
+        self.dof_ = len(self.chain_.get_joint_parameter_names())
+        self.dq_ = np.zeros(self.dof_)
+
+        # setup model
+        T = 1
+        builder = optas.OptimizationBuilder(T, robots=[kuka], derivs_align=True)
+
+        
+
+        # Setup parameters
+        qc = builder.add_parameter("qc", kuka.ndof)  # current robot joint configuration
+        pg = builder.add_parameter("pg", 7) # current robot joint configuration
+        # pg_int_ex = builder.add_parameter("pg", 7) # current robot joint configuration
+        fh = builder.add_parameter("fh", 6)  
+
+        # Get joint velocity
+        dq = builder.get_model_state(self.name, t=0, time_deriv=1)
+
+        # Get next joint state
+        q = qc + dt * dq
+        
+
+        # Get jacobian
+        J = kuka.get_global_link_geometric_jacobian(end_link_name, qc)
+
+        # Get end-effector velocity
+        dp = J @ dq
+
+        # Get current end-effector position
+        pc = kuka.get_global_link_position(end_link_name, qc)
+        Rc = kuka.get_global_link_rotation(end_link_name, qc)
+        
+        # Get 
+        Om = skew(dp[3:]) 
+
+
+        p = Rc.T @ dt @ dp[:3]
+        R = Rc.T @ (Om * dt + I3()) @ Rc
+        
+        # Cost: match end-effector position
+        Rotq = Quaternion(x = pg[4],y = pg[5],z = pg[6],w =pg[3])
+        Rg = Rotq.getrotm()
+        
+        pg_ee = -Rc.T @ pc + Rc.T @ pg[:3]
+        # pg_ee = optas.DM([0.0,0.0,0.0]).T
+        # pg_ee = -Rc.T @ pc
+        Rg_ee = Rc.T @ Rg
+
+        Bx = 0.05
+        By = 0.05
+
+        # diffp = optas.diag([2.0, 2.0, 0.0]) @ (p - 0.1*pg_ee[:3])
+        # diffp = optas.diag([0.2, 0.2, 0.2]) @ p
+        
+        diffR = Rg_ee.T @ R
+        cvf = Rc.T @ fh[:3]
+        # diffFl =optas.diag([0.25, 0.25, 0.25]) @ Rc.T @ fh[:3] -  Rc.T @ dp[:3]
+        # diffFl =optas.diag([0.00, 0.00, 0.25]) @ Rc.T @ fh[:3] -  Rc.T @ dp[:3]
+        # diffFl = optas.diag([1.0, 1.0, 0.0]) @ (p- pg_ee- optas.diag([Bx, By, 0.0]) @ cvf ) +diffFl
+        diffp = optas.diag([1.0, 1.0, 0.0]) @ ( pg_ee[:3] - p) 
+        # diffFl = optas.diag([0.10, 0.10, 0.1]) @ (-Rc.T @ fh[:3] +  Rc.T @ dp[:3])
+        diffFl = optas.diag([0.00, 0.00, 0.1]) @ (-Rc.T @ fh[:3] +  Rc.T @ dp[:3])
+        
+
+
+        rvf = Rc.T @ fh[3:]
+        diffFR =  optas.diag([0.1, 0.1, 0.1])@ rvf - Rc.T @dp[3:]
+        # diffFr = nf @ nf.T @ (fh[3:] - optas.diag([1e-3, 1e-3, 1e-3]) @ Rc.T @dq[3:])
+        w = optas.clip(x = optas.norm_2(pg_ee[0:2]),lo = 1e-5,hi = 0.1)
+        W_p = optas.diag([1e9 , 1e9 , 1e3])/w 
+        builder.add_cost_term("match_p", diffp.T @ W_p @ diffp)
+
+        # builder.add_leq_inequality_constraint(
+        #     "p_con", diffp.T @ diffp, 0.0000001
+        # )
+
+        W_f = optas.diag([1e3, 1e3, 1e3])
+        builder.add_cost_term("match_f", diffFl.T @ W_f @ diffFl)
+
+        # W_fr = optas.diag([1e1, 1e1, 1e1])
+        # builder.add_cost_term("match_fr", diffFR.T @ W_fr @ diffFR)
+        
+        w_dq = 0.2 * w 
+        builder.add_cost_term("min_dq", w_dq * optas.sumsqr(dq))
+
+        Kp = optas.diag([10.0, 10.0])
+        u = Kp @ pg_ee[:2]
+
+
+
+        builder.add_leq_inequality_constraint(
+            "dp_1", p[0] * p[0], 1e-3
+        )
+        builder.add_leq_inequality_constraint(
+            "dp_2", p[1] * p[1], 1e-3
+        )
+
+
+ 
+        builder.add_leq_inequality_constraint(
+            "dq1", dq[0] * dq[0], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq2", dq[1] * dq[1], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq3", dq[2] * dq[2], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq4", dq[3] * dq[3], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq5", dq[4] * dq[4], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq6", dq[5] * dq[5], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq7", dq[6] * dq[6], 1e2
+        )
+
+
+
+
+        Om = skew(dp[3:]) 
+        
+        # print("eff_goal size = {0}".format(eff_goal.size()))
+        # RF = (Om * dt + I3()) @ Rc  
+        RF = (Om * dt + I3()) @ Rc
+
+        # RF = kuka.get_global_link_rotation(end_link_name, qc+dq)
+        zF = RF[:,2]
+        #TODO
+        axis_align_update = Rg[:,2]
+        builder.add_cost_term("eff_axis_align", 1e4 * (optas.sumsqr(zF.T @ axis_align_update - 1.0)))
+
+        self.distance = optas.Function('distance', [qc, pg], [Rc])
+        self.rp = optas.Function('rp', [qc, pg], [Rg])
+        # self.zf = optas.Function('zf', [qc, pg], [zF])
+
+        optimization = builder.build()
+        self.solver = optas.CasADiSolver(optimization).setup("sqpmethod")
+        # self.solver = optas.ScipyMinimizeSolver(optimization).setup('SLSQP')
+        # Setup variables required later
+
+        
+        
+
+        self.solution = None
+        
+
+    # def external_integral_term(self, pg, qc, fh):
+
+
+    def compute_target_velocity(self, qc, pg, fh):
+        # solution = self.solver.solve()
+        dq = np.zeros(7)
+
+        if self.solution is not None:
+            self.solver.reset_initial_seed(self.solution)
+        else:
+            self.solver.reset_initial_seed({f"{self.name}/q": optas.horzcat(qc, qc)})
+        # self.solver.reset_parameters({"rcm": self._rcm, "qc": q, "dq_goal": self.dq_})
+        self.solver.reset_parameters({"qc": optas.DM(qc), "pg": optas.DM(pg), "fh": optas.DM(fh)})
+
+        self.solution = self.solver.solve()
+        if self.solver.did_solve():
+            dq = self.solution[f"{self.name}/dq"].toarray().flatten()
+        else:
+            dq = np.zeros(7)
+
+        return dq
+    
+    def __call__(self, q: np.ndarray, pg: np.ndarray, tau_ext: np.ndarray) -> np.ndarray:
+        
+        jacobian = self.chain_.jacobian(q)
+        # J^T fext = tau
+        if tau_ext.size != self.dof_ or q.size != self.dof_:
+            raise BufferError(
+                f"Expected joint position and torque with {self.dof_} dof, got {q.size()} amd {tau_ext.size()} dof."
+            )
+
+        jacobian_inv = np.linalg.pinv(jacobian, rcond=0.05)
+
+        f_ext = jacobian_inv.T @ tau_ext
+        f_ext_raw = copy.deepcopy(f_ext)
+
+        f_ext = np.where(
+            abs(f_ext) > self.f_threshold_,
+            self.dx_gain_ @ np.sign(f_ext) * (abs(f_ext) - self.f_threshold_),
+            0.0
+        )
+
+
+        dq = self.compute_target_velocity(q, pg, f_ext)
+        self.dq_ = (1.0 - self.smooth_) * self.dq_ + self.smooth_ * dq
+
+        return self.dq_, f_ext_raw
+    
+class TrackingControllerForceFusion:
+    def __init__(self,
+        urdf_string: str,
+        end_link_name: str = "lbr_link_ee",
+        root_link_name: str = "lbr_link_0",
+        f_threshold: np.ndarray = np.array([2.0 , 2.0, 2.0, 0.5, 0.5, 0.5]),
+        dx_gain: np.ndarray = np.array([2.0, 2.0, 2.0, 1.0, 1.0, 1.0]),
+        smooth: float = 0.15,
+        gamma: float = 0.1)->None:
+        dt = 0.01
+        self.gamma =gamma
+        pi = optas.np.pi  # 3.141...
+        T = 1  # no. time steps in trajectory
+        self.f_threshold_ = f_threshold
+        self.dx_gain_ = np.diag(dx_gain)
+        self.smooth_ = smooth
+        # Setup robot
+        kuka = optas.RobotModel(
+            xacro_filename=urdf_string,
+            time_derivs=[1],  # i.e. joint velocity
+        )
+
+        align = optas.TaskModel(
+            name="appro",
+            dim = 2,
+            #time_derivs=[0],  # i.e. joint velocity
+        )
+        self.name = kuka.get_name()
+
+        self.taskname = align.get_name()
+
+        urdf_string_ = xacro.process(urdf_string)
+        self.chain_ = kinpy.build_serial_chain_from_urdf(
+            data=urdf_string_, end_link_name=end_link_name, root_link_name=root_link_name
+        )
+
+        self.dof_ = len(self.chain_.get_joint_parameter_names())
+        self.dq_ = np.zeros(self.dof_)
+
+        # setup model
+        T = 1
+        builder = optas.OptimizationBuilder(T, robots=[kuka], derivs_align=True)
+
+        
+
+        # Setup parameters
+        qc = builder.add_parameter("qc", kuka.ndof)  # current robot joint configuration
+        pg = builder.add_parameter("pg", 7) # current robot joint configuration
+        # pg_int_ex = builder.add_parameter("pg", 7) # current robot joint configuration
+        fh = builder.add_parameter("fh", 6) 
+        # it = builder.add_parameter("it", 3)  
+
+        # Get joint velocity
+        dq = builder.get_model_state(self.name, t=0, time_deriv=1)
+
+        # Get next joint state
+        q = qc + dt * dq
+        
+
+        # Get jacobian
+        J = kuka.get_global_link_geometric_jacobian(end_link_name, qc)
+
+        # Get end-effector velocity
+        dp = J @ dq
+
+        # Get current end-effector position
+        pc = kuka.get_global_link_position(end_link_name, qc)
+        Rc = kuka.get_global_link_rotation(end_link_name, qc)
+        
+        # Get 
+        Om = skew(dp[3:]) 
+
+
+        p = Rc.T @ dt @ dp[:3]
+        R = Rc.T @ (Om * dt + I3()) @ Rc
+        
+        # Cost: match end-effector position
+        Rotq = Quaternion(x = pg[4],y = pg[5],z = pg[6],w =pg[3])
+        Rg = Rotq.getrotm()
+        
+        pg_ee = -Rc.T @ pc + Rc.T @ pg[:3]
+        # pg_ee = optas.DM([0.0,0.0,0.0]).T
+        # pg_ee = -Rc.T @ pc
+        Rg_ee = Rc.T @ Rg
+
+        Bx = 0.05
+        By = 0.05
+
+        # diffp = optas.diag([2.0, 2.0, 0.0]) @ (p - 0.1*pg_ee[:3])
+        # diffp = optas.diag([0.2, 0.2, 0.2]) @ p
+        
+        diffR = Rg_ee.T @ R
+        cvf = Rc.T @ fh[:3]
+        # diffFl =optas.diag([0.25, 0.25, 0.25]) @ Rc.T @ fh[:3] -  Rc.T @ dp[:3]
+        # diffFl =optas.diag([0.00, 0.00, 0.25]) @ Rc.T @ fh[:3] -  Rc.T @ dp[:3]
+        # diffFl = optas.diag([1.0, 1.0, 0.0]) @ (p- pg_ee- optas.diag([Bx, By, 0.0]) @ cvf ) +diffFl
+        diffp = optas.diag([1.0, 1.0, 0.0]) @ ( pg_ee[:3] + gamma *cvf - p) 
+        # diffFl = optas.diag([0.10, 0.10, 0.1]) @ (-Rc.T @ fh[:3] +  Rc.T @ dp[:3])
+        diffFl = optas.diag([0.00, 0.00, 0.1]) @ (-Rc.T @ fh[:3] +  Rc.T @ dp[:3])
+        
+
+
+        rvf = Rc.T @ fh[3:]
+        diffFR =  optas.diag([0.1, 0.1, 0.1])@ rvf - Rc.T @dp[3:]
+        # diffFr = nf @ nf.T @ (fh[3:] - optas.diag([1e-3, 1e-3, 1e-3]) @ Rc.T @dq[3:])
+        w = optas.clip(x = optas.norm_2(pg_ee[0:2]),lo = 1e-5,hi = 0.1)
+        W_p = optas.diag([1e9 , 1e9 , 1e3])#/w
+        builder.add_cost_term("match_p", diffp.T @ W_p @ diffp)
+
+        # builder.add_leq_inequality_constraint(
+        #     "p_con", diffp.T @ diffp, 0.0000001
+        # )
+
+        W_f = optas.diag([1e3, 1e3, 1e3])
+        builder.add_cost_term("match_f", diffFl.T @ W_f @ diffFl)
+
+        # W_fr = optas.diag([1e1, 1e1, 1e1])
+        # builder.add_cost_term("match_fr", diffFR.T @ W_fr @ diffFR)
+        
+        w_dq = 0.02  
+        builder.add_cost_term("min_dq", w_dq * optas.sumsqr(dq))
+
+        Kp = optas.diag([10.0, 10.0])
+        u = Kp @ pg_ee[:2]
+
+
+
+        builder.add_leq_inequality_constraint(
+            "dp_1", p[0] * p[0], 1e-3
+        )
+        builder.add_leq_inequality_constraint(
+            "dp_2", p[1] * p[1], 1e-3
+        )
+
+
+ 
+        builder.add_leq_inequality_constraint(
+            "dq1", dq[0] * dq[0], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq2", dq[1] * dq[1], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq3", dq[2] * dq[2], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq4", dq[3] * dq[3], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq5", dq[4] * dq[4], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq6", dq[5] * dq[5], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq7", dq[6] * dq[6], 1e2
+        )
+
+
+
+
+        Om = skew(dp[3:]) 
+        
+        # print("eff_goal size = {0}".format(eff_goal.size()))
+        # RF = (Om * dt + I3()) @ Rc  
+        RF = (Om * dt + I3()) @ Rc
+
+        # RF = kuka.get_global_link_rotation(end_link_name, qc+dq)
+        zF = RF[:,2]
+        #TODO
+        Crx, Cry, Crz = 0.1, 0.1, 0.1
+        OmTau = skew(fh[3:])
+        Rg_update = (optas.diag([Crx, Cry, Crz])@OmTau * dt +I3())@ Rg
+        axis_align_update = Rg_update[:,2]
+        builder.add_cost_term("eff_axis_align", 1e4 * (optas.sumsqr(zF.T @ axis_align_update - 1.0)))
+
+        self.distance = optas.Function('distance', [qc, pg], [Rc])
+        self.rp = optas.Function('rp', [qc, pg], [Rg])
+        self.lateral_error = optas.Function('le', [qc,pg], [pg_ee])
+        # self.zf = optas.Function('zf', [qc, pg], [zF])
+
+        optimization = builder.build()
+        self.solver = optas.CasADiSolver(optimization).setup("sqpmethod")
+        # self.solver = optas.ScipyMinimizeSolver(optimization).setup('SLSQP')
+        # Setup variables required later
+
+        
+        
+
+        self.solution = None
+        self.integral_term = np.array([0.0]*3)
+        
+
+    # def external_integral_term(self, pg, qc, fh):
+
+
+    def compute_target_velocity(self, qc, pg, fh):
+        # solution = self.solver.solve()
+        dq = np.zeros(7)
+        if self.solution is not None:
+            self.solver.reset_initial_seed(self.solution)
+        else:
+            self.solver.reset_initial_seed({f"{self.name}/q": optas.horzcat(qc, qc)})
+        # self.solver.reset_parameters({"rcm": self._rcm, "qc": q, "dq_goal": self.dq_})
+        self.solver.reset_parameters({"qc": optas.DM(qc), 
+                                      "pg": optas.DM(pg), 
+                                      "fh": optas.DM(fh)})
+
+        self.solution = self.solver.solve()
+        if self.solver.did_solve():
+            dq = self.solution[f"{self.name}/dq"].toarray().flatten()
+        else:
+            dq = np.zeros(7)
+
+        return dq
+    
+    def __call__(self, q: np.ndarray, pg: np.ndarray, tau_ext: np.ndarray) -> np.ndarray:
+        
+        jacobian = self.chain_.jacobian(q)
+        # J^T fext = tau
+        if tau_ext.size != self.dof_ or q.size != self.dof_:
+            raise BufferError(
+                f"Expected joint position and torque with {self.dof_} dof, got {q.size()} amd {tau_ext.size()} dof."
+            )
+
+        jacobian_inv = np.linalg.pinv(jacobian, rcond=0.05)
+        current_pose = self.chain_.forward_kinematics(q)
+        T_be = from_pq2T44(current_pose.pos,current_pose.rot)
+
+        f_ext = jacobian_inv.T @ tau_ext
+        f_ext_raw = copy.deepcopy(f_ext)
+
+        f_ext = np.where(
+            abs(f_ext) > self.f_threshold_,
+            self.dx_gain_ @ np.sign(f_ext) * (abs(f_ext) - self.f_threshold_),
+            0.0
+        )
+        dist = np.diag([1.0, 1.0, 0.0]) @ self.lateral_error(q, pg).toarray().flatten()
+
+        # jacobian_ = np.array(self.chain_.jacobian(q))
+        # jacobian_inv_ = np.linalg.pinv(jacobian_, rcond=0.05)
+        
+
+        # print("icct = ",icct)
+
+        K = 0.3
+        #np.all(dist < 0.1 and dist > -0.1)
+        # if(dist.all()<0.1 and dist.all()>-0.1):
+        #     self.integral_term = self.integral_term + dist
+        #     # self.integral_term = np.array([0.0]*3)
+        #     icct = - jacobian_inv[:, :3] @ T_be[:3,:3].T @  (self.gamma *dist + K*(self.gamma* self.integral_term +dist))
+
+        #     # integral control compensatation term
+        # else:
+        #     self.integral_term = np.array([0.0]*3)
+        #     icct = np.array([0.]*7)
+
+
+        dq = self.compute_target_velocity(q, pg, f_ext)
+        self.dq_ = (1.0 - self.smooth_) * self.dq_ + self.smooth_ * dq
+
+        return self.dq_, f_ext_raw
+
+
+class TrackingControllerSMC:
+    def __init__(self,
+        urdf_string: str,
+        end_link_name: str = "lbr_link_ee",
+        root_link_name: str = "lbr_link_0",
+        f_threshold: np.ndarray = np.array([2.0 , 2.0, 2.0, 0.5, 0.5, 0.5]),
+        dx_gain: np.ndarray = np.array([2.0, 2.0, 2.0, 1.0, 1.0, 1.0]),
+        smooth: float = 0.15,
+        gamma: float = 0.1)->None:
+        dt = 0.01
+        self.gamma =gamma
+        pi = optas.np.pi  # 3.141...
+        T = 1  # no. time steps in trajectory
+        self.f_threshold_ = f_threshold
+        self.dx_gain_ = np.diag(dx_gain)
+        self.smooth_ = smooth
+        # Setup robot
+        kuka = optas.RobotModel(
+            xacro_filename=urdf_string,
+            time_derivs=[1],  # i.e. joint velocity
+        )
+
+        align = optas.TaskModel(
+            name="appro",
+            dim = 2,
+            #time_derivs=[0],  # i.e. joint velocity
+        )
+        self.name = kuka.get_name()
+
+        self.taskname = align.get_name()
+
+        urdf_string_ = xacro.process(urdf_string)
+        self.chain_ = kinpy.build_serial_chain_from_urdf(
+            data=urdf_string_, end_link_name=end_link_name, root_link_name=root_link_name
+        )
+
+        self.dof_ = len(self.chain_.get_joint_parameter_names())
+        self.dq_ = np.zeros(self.dof_)
+
+        # setup model
+        T = 1
+        builder = optas.OptimizationBuilder(T, robots=[kuka], derivs_align=True)
+
+        
+
+        # Setup parameters
+        qc = builder.add_parameter("qc", kuka.ndof)  # current robot joint configuration
+        pg = builder.add_parameter("pg", 7) # current robot joint configuration
+        # pg_int_ex = builder.add_parameter("pg", 7) # current robot joint configuration
+        fh = builder.add_parameter("fh", 6) 
+        it = builder.add_parameter("it", 3)  
+
+        # Get joint velocity
+        dq = builder.get_model_state(self.name, t=0, time_deriv=1)
+
+        # Get next joint state
+        q = qc + dt * dq
+        
+
+        # Get jacobian
+        J = kuka.get_global_link_geometric_jacobian(end_link_name, qc)
+
+        # Get end-effector velocity
+        dp = J @ dq
+
+        # Get current end-effector position
+        pc = kuka.get_global_link_position(end_link_name, qc)
+        Rc = kuka.get_global_link_rotation(end_link_name, qc)
+        
+        # Get 
+        Om = skew(dp[3:]) 
+
+
+        p = Rc.T @ dt @ dp[:3]
+        R = Rc.T @ (Om * dt + I3()) @ Rc
+        
+        # Cost: match end-effector position
+        Rotq = Quaternion(x = pg[4],y = pg[5],z = pg[6],w =pg[3])
+        Rg = Rotq.getrotm()
+        
+        pg_ee = -Rc.T @ pc + Rc.T @ pg[:3]
+        # pg_ee = optas.DM([0.0,0.0,0.0]).T
+        # pg_ee = -Rc.T @ pc
+        Rg_ee = Rc.T @ Rg
+
+        Bx = 0.05
+        By = 0.05
+
+        # diffp = optas.diag([2.0, 2.0, 0.0]) @ (p - 0.1*pg_ee[:3])
+        # diffp = optas.diag([0.2, 0.2, 0.2]) @ p
+        
+        diffR = Rg_ee.T @ R
+        cvf = Rc.T @ fh[:3]
+        # diffFl =optas.diag([0.25, 0.25, 0.25]) @ Rc.T @ fh[:3] -  Rc.T @ dp[:3]
+        # diffFl =optas.diag([0.00, 0.00, 0.25]) @ Rc.T @ fh[:3] -  Rc.T @ dp[:3]
+        # diffFl = optas.diag([1.0, 1.0, 0.0]) @ (p- pg_ee- optas.diag([Bx, By, 0.0]) @ cvf ) +diffFl
+        diffp = optas.diag([1.0, 1.0, 0.0]) @ ( pg_ee[:3] + gamma *it - p) 
+        # diffFl = optas.diag([0.10, 0.10, 0.1]) @ (-Rc.T @ fh[:3] +  Rc.T @ dp[:3])
+        diffFl = optas.diag([0.00, 0.00, 0.1]) @ (-Rc.T @ fh[:3] +  Rc.T @ dp[:3])
+        
+
+
+        rvf = Rc.T @ fh[3:]
+        diffFR =  optas.diag([0.1, 0.1, 0.1])@ rvf - Rc.T @dp[3:]
+        # diffFr = nf @ nf.T @ (fh[3:] - optas.diag([1e-3, 1e-3, 1e-3]) @ Rc.T @dq[3:])
+        w = optas.clip(x = optas.norm_2(pg_ee[0:2]),lo = 1e-5,hi = 0.1)
+        W_p = optas.diag([1e9 , 1e9 , 1e3])#/w
+        builder.add_cost_term("match_p", diffp.T @ W_p @ diffp)
+
+        # builder.add_leq_inequality_constraint(
+        #     "p_con", diffp.T @ diffp, 0.0000001
+        # )
+
+        W_f = optas.diag([1e3, 1e3, 1e3])
+        builder.add_cost_term("match_f", diffFl.T @ W_f @ diffFl)
+
+        # W_fr = optas.diag([1e1, 1e1, 1e1])
+        # builder.add_cost_term("match_fr", diffFR.T @ W_fr @ diffFR)
+        
+        w_dq = 0.02  
+        builder.add_cost_term("min_dq", w_dq * optas.sumsqr(dq))
+
+        Kp = optas.diag([10.0, 10.0])
+        u = Kp @ pg_ee[:2]
+
+
+
+        builder.add_leq_inequality_constraint(
+            "dp_1", p[0] * p[0], 1e-3
+        )
+        builder.add_leq_inequality_constraint(
+            "dp_2", p[1] * p[1], 1e-3
+        )
+
+
+ 
+        builder.add_leq_inequality_constraint(
+            "dq1", dq[0] * dq[0], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq2", dq[1] * dq[1], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq3", dq[2] * dq[2], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq4", dq[3] * dq[3], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq5", dq[4] * dq[4], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq6", dq[5] * dq[5], 1e2
+        )
+        builder.add_leq_inequality_constraint(
+            "dq7", dq[6] * dq[6], 1e2
+        )
+
+
+
+
+        Om = skew(dp[3:]) 
+        
+        # print("eff_goal size = {0}".format(eff_goal.size()))
+        # RF = (Om * dt + I3()) @ Rc  
+        RF = (Om * dt + I3()) @ Rc
+
+        # RF = kuka.get_global_link_rotation(end_link_name, qc+dq)
+        zF = RF[:,2]
+        #TODO
+        axis_align_update = Rg[:,2]
+        builder.add_cost_term("eff_axis_align", 1e4 * (optas.sumsqr(zF.T @ axis_align_update - 1.0)))
+
+        self.distance = optas.Function('distance', [qc, pg], [Rc])
+        self.rp = optas.Function('rp', [qc, pg], [Rg])
+        self.lateral_error = optas.Function('le', [qc,pg], [pg_ee])
+        # self.zf = optas.Function('zf', [qc, pg], [zF])
+
+        optimization = builder.build()
+        self.solver = optas.CasADiSolver(optimization).setup("sqpmethod")
+        # self.solver = optas.ScipyMinimizeSolver(optimization).setup('SLSQP')
+        # Setup variables required later
+
+        
+        
+
+        self.solution = None
+        self.integral_term = np.array([0.0]*3)
+        
+
+    # def external_integral_term(self, pg, qc, fh):
+
+
+    def compute_target_velocity(self, qc, pg, fh, integral):
+        # solution = self.solver.solve()
+        dq = np.zeros(7)
+        if self.solution is not None:
+            self.solver.reset_initial_seed(self.solution)
+        else:
+            self.solver.reset_initial_seed({f"{self.name}/q": optas.horzcat(qc, qc)})
+        # self.solver.reset_parameters({"rcm": self._rcm, "qc": q, "dq_goal": self.dq_})
+        self.solver.reset_parameters({"qc": optas.DM(qc), 
+                                      "pg": optas.DM(pg), 
+                                      "fh": optas.DM(fh),
+                                      "it": optas.DM(integral)})
+
+        self.solution = self.solver.solve()
+        if self.solver.did_solve():
+            dq = self.solution[f"{self.name}/dq"].toarray().flatten()
+        else:
+            dq = np.zeros(7)
+
+        return dq
+    
+    def __call__(self, q: np.ndarray, pg: np.ndarray, tau_ext: np.ndarray) -> np.ndarray:
+        
+        jacobian = self.chain_.jacobian(q)
+        # J^T fext = tau
+        if tau_ext.size != self.dof_ or q.size != self.dof_:
+            raise BufferError(
+                f"Expected joint position and torque with {self.dof_} dof, got {q.size()} amd {tau_ext.size()} dof."
+            )
+
+        jacobian_inv = np.linalg.pinv(jacobian, rcond=0.05)
+        current_pose = self.chain_.forward_kinematics(q)
+        T_be = from_pq2T44(current_pose.pos,current_pose.rot)
+
+        f_ext = jacobian_inv.T @ tau_ext
+        f_ext_raw = copy.deepcopy(f_ext)
+
+        f_ext = np.where(
+            abs(f_ext) > self.f_threshold_,
+            self.dx_gain_ @ np.sign(f_ext) * (abs(f_ext) - self.f_threshold_),
+            0.0
+        )
+        dist = np.diag([1.0, 1.0, 0.0]) @ self.lateral_error(q, pg).toarray().flatten()
+
+        # jacobian_ = np.array(self.chain_.jacobian(q))
+        # jacobian_inv_ = np.linalg.pinv(jacobian_, rcond=0.05)
+        
+
+        # print("icct = ",icct)
+
+        K = 0.3
+        #np.all(dist < 0.1 and dist > -0.1)
+        if(dist.all()<0.1 and dist.all()>-0.1):
+            self.integral_term = self.integral_term + dist
+            # self.integral_term = np.array([0.0]*3)
+            icct = - jacobian_inv[:, :3] @ T_be[:3,:3].T @  (self.gamma *dist + K*(self.gamma* self.integral_term +dist))
+
+            # integral control compensatation term
+        else:
+            self.integral_term = np.array([0.0]*3)
+            icct = np.array([0.]*7)
+
+
+        dq = self.compute_target_velocity(q, pg, f_ext, np.array([0.0]*3)) + icct
+        self.dq_ = (1.0 - self.smooth_) * self.dq_ + self.smooth_ * dq
+
+        return self.dq_, f_ext_raw
+
+
+
 
 
 class AdmittanceControlNode(Node):
@@ -732,7 +1628,7 @@ class AdmittanceControlNode(Node):
         print("self.params = {0}".format(self.params))
 
         # The controller based on optas
-        self.controller_optas = TrackingController(
+        self.controller_optas = TrackingControllerForceFusion(
             urdf_string=path,
             end_link_name=self.end_link_name_,
             root_link_name=self.root_link_name_,
@@ -777,6 +1673,7 @@ class AdmittanceControlNode(Node):
         self.T_bt = np.zeros([4,4])
         self.T_bt[3,3] = 1.0
         self.tau_ext_ground = None
+        self.force_filter = TD_list_filter(T=0.01)
 
         # pg = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
@@ -824,10 +1721,10 @@ class AdmittanceControlNode(Node):
             T_et = from_msg2T44(self.goal_pose_)
             self.T_bt = T_be @ T_et
         
-            print("self.T_be z = {0}".format(T_be[:,2]))
-            print("self.T_et z = {0}".format(T_et[:,2]))
+            # print("self.T_be z = {0}".format(T_be[:,2]))
+            # print("self.T_et z = {0}".format(T_et[:,2]))
         
-        print("self.T_bt z = {0}".format(self.T_bt[:,2]))
+        # print("self.T_bt z = {0}".format(self.T_bt[:,2]))
 
         pose_bt = from_T442pose(self.T_bt)
         csv_save("/home/thy/ros2_ws/pose_bt.csv", pose_bt)
@@ -860,9 +1757,9 @@ class AdmittanceControlNode(Node):
         # print(self.jacobian_)
         temp_r = np.array([0.0]*6)
         temp_r[:3] = R_be.T @ (pose_bt[:3]- current_pose.pos - np.array([0.0, 0.0, 0.2]))
-        print("f_ext = {0}".format(f_ext))
-        print("pose_bt = {0}".format(pose_bt))
-        print("current_pose.pos = {0}".format(current_pose.pos))
+        # print("f_ext = {0}".format(f_ext))
+        # print("pose_bt = {0}".format(pose_bt))
+        # print("current_pose.pos = {0}".format(current_pose.pos))
 
         # temp_r[:3] = np.array([0.0, 0.1, 0.0])
 
